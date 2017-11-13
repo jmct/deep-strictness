@@ -167,6 +167,7 @@ evaluate !() = return ()
 data ListDemand (d :: (* -> *) -> *) (f :: * -> *) =
   Cons (f (Maybe (d f)))
        (f (Maybe (ListDemand d f)))
+  | Nil (f (Maybe (PrimDemand f)))
 
 showDemand_primList :: Maybe (ListDemand PrimDemand Identity) -> String
 showDemand_primList Nothing = "…"
@@ -179,6 +180,11 @@ showDemand_primList (Just list) =
                  Just Demanded -> "■"
                  Nothing       -> "_"
       in x' : xs'
+    go (Nil (Identity x)) =
+      let x' = case x of
+                Just Demanded -> "]"
+                Nothing       -> "…"
+      in [x']
 
 printDemand_primList = putStrLn . showDemand_primList
 
@@ -204,6 +210,15 @@ demandList c f as =
     evaluate $ c . f $ instrumentListD topDemand as
     traverse derefDemand =<< readIORef topDemand
 
+{-# NOINLINE demandList' #-}
+demandList' :: ([a] -> ()) -> [a]
+           -> Maybe (ListDemand PrimDemand Identity)
+demandList' c as =
+  unsafePerformIO $ do
+    topDemand <- newIORef Nothing
+    evaluate $ c $ instrumentListD topDemand as
+    traverse derefDemand =<< readIORef topDemand
+
 -- Recursively traverse a pointer-based demand and freeze it into an immutable
 -- demand suitable for the user-facing API.
 derefDemand :: ListDemand PrimDemand IORef -> IO (ListDemand PrimDemand Identity)
@@ -217,6 +232,9 @@ derefDemand demand = do
            Just listDemand -> do
              listDemand' <- derefDemand listDemand
              return $ Cons (Identity primDemand) (Identity (Just listDemand'))
+    Nil primRef ->
+      do primDemand <- coerce <$> readIORef primRef
+         return $ Nil (Identity primDemand)
 
 -- Instrument lists to report their evaluation in a particular IORef
 
@@ -229,7 +247,13 @@ derefDemand demand = do
 instrumentListD :: IORef (Maybe (ListDemand PrimDemand IORef)) -> [a] -> [a]
 instrumentListD demand as =
   case as of
-    [] -> []
+    [] ->
+      unsafePerformIO $ do
+        putStrLn "In Nil case of instrumentListD"
+        nullaryDemand <- newIORef $ Just Demanded
+        writeIORef demand $
+            Just (Nil nullaryDemand)
+        return $ []
     (a : as) ->
       unsafePerformIO $ do
         primDemand <- newIORef Nothing
