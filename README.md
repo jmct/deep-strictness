@@ -6,7 +6,7 @@ There are several potential challenges which we foresee. GHC Core, as a real-wor
 
 Our general plan is to hook into GHC Core to produce a higher-order call graph for functions in a target module (ideally after aggressive inlining has taken place). For each pointer-based data structure taken as input to a function, we will generically derive a “shape” for that structure, and analyze the input call graph to determine the greatest shape which must be evaluated by the function (i.e. the prefix of the data structure which is demanded in all executions). This analysis will likely be based on the application of type-state analysis to a state-space inhabited by the lattice of (approximated) data structure shapes. If there is time for us to do so, we plan to heuristically infer loop invariants for (mutually) recursive functions, and also allow user annotations to provide checkable loop invariants when the optimization cannot infer them. According to the results of the analysis, we will generate modified Core functions that partially normalize their arguments on entry—and forward these modified Core terms to the next stage in the compilation pipeline. We should ensure that our analysis fires before the traditional strictness analysis so that it can take advantage of our output.
 
-People to consult: Simon Peyton Jones, Joachim Breitner, José Manual Trilla, Antal Spector-Zabusky
+People to consult: Simon Peyton Jones, Joachim Breitner, José Manual Calderón Trilla, Antal Spector-Zabusky
 
 Papers to read:
 
