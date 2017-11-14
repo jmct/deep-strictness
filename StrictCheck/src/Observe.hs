@@ -1,4 +1,5 @@
 {-# language TypeInType, ScopedTypeVariables, StandaloneDeriving, UndecidableInstances, BangPatterns #-}
+{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 
 ------------------------------------------------------------------------
 -- Observing the strictness of Haskell functions from within Haskell! --
@@ -11,9 +12,8 @@ import Control.Spoon
 import Data.Coerce
 import Data.Foldable
 import Data.Maybe
-import Data.IORef  -- TODO: use IVars instead?
+import Data.IORef
 import Data.Functor.Identity
-import Data.Functor.Classes
 import Control.DeepSeq
 import Data.Kind
 import Data.List
@@ -86,8 +86,9 @@ decreasingBottoms as =
     where
       unitBottoms = undefined : map (() :) unitBottoms
 
+
 {-# NOINLINE demandCount #-}
-demandCount :: (b -> ()) -> ([a] -> b) -> [a] -> Int
+demandCount :: Context b -> ([a] -> b) -> [a] -> Int
 demandCount c f as = fromJust . asum $
   map fstIfDefined $
         zip [0..] $ fmap (c . f) (decreasingBottoms as)
@@ -107,14 +108,14 @@ demandCount c f as = fromJust . asum $
 
 {-# NOINLINE instrumentListR #-}
 instrumentListR :: IORef Int -> [a] -> [a]
-instrumentListR count [] = []
+instrumentListR _     []       = []
 instrumentListR count (a : as) =
   unsafePerformIO $ do
     atomicModifyIORef' count (\x -> (succ x, ()))
     return $ a : instrumentListR count as
 
 {-# NOINLINE demandCount' #-}
-demandCount' :: (b -> ()) -> ([a] -> b) -> [a] -> Int
+demandCount' :: Context b -> ([a] -> b) -> [a] -> Int
 demandCount' c f as =
   unsafePerformIO $ do
     count <- newIORef 0
@@ -160,32 +161,37 @@ evaluate !() = return ()
 -- derive their corresponding demand types. We should also be able to derive
 -- Show, Eq, and Arbitrary instances, necessary for QuickCheck.
 
--- TODO: This definition is subtly wrong, in that it cannot represent or
--- instrument whether a nil constructor is forced. We need another case in
--- the ADT for ListDemand which contains a (f (Maybe (PrimDemand f)))
+-- TODO: We do not currently represent the *value* of primitives in our demand
+-- types. I think that this is subtly wrong: when we get down to a primitive
+-- (i.e. an integer) we should actually store its value in the demand type. This
+-- means that even more demand transformers will be partial--but this does not
+-- matter, because they will always be handed the *actual* demand for a
+-- particular situation. We want to represent the *entire subshape* of the
+-- input, and we're not doing so if we don't put actual primitives in the slot
+-- where they belong.
 
 data ListDemand (d :: (* -> *) -> *) (f :: * -> *) =
   Cons (f (Maybe (d f)))
        (f (Maybe (ListDemand d f)))
-  | Nil (f (Maybe (PrimDemand f)))
+  | Nil
 
 showDemand_primList :: Maybe (ListDemand PrimDemand Identity) -> String
 showDemand_primList Nothing = "…"
 showDemand_primList (Just list) =
-  "[" ++ intercalate ", " (go list) ++ ", …"
+  let strings = go list
+      prefix = init strings
+      termination = last strings
+  in "[" ++ (intercalate ", " prefix) ++ termination
   where
+    go Nil = ["]"]
     go (Cons (Identity x) (Identity xs)) =
-      let xs' = fromMaybe [] (go <$> xs)
+      let xs' = fromMaybe [", …"] (go <$> xs)
           x' = case x of
                  Just Demanded -> "■"
                  Nothing       -> "_"
       in x' : xs'
-    go (Nil (Identity x)) =
-      let x' = case x of
-                Just Demanded -> "]"
-                Nothing       -> "…"
-      in [x']
 
+printDemand_primList :: Maybe (ListDemand PrimDemand Identity) -> IO ()
 printDemand_primList = putStrLn . showDemand_primList
 
 data PrimDemand f = Demanded deriving Show
@@ -202,13 +208,15 @@ type ListOfPairsOfIntsDemand =
 -- Calculate the demand on the list as when f is run on it in the context c
 
 {-# NOINLINE demandList #-}
-demandList :: (b -> ()) -> ([a] -> b) -> [a]
-           -> Maybe (ListDemand PrimDemand Identity)
-demandList c f as =
+demandList :: Context b -> ([a] -> b) -> [a]
+           -> (b, Maybe (ListDemand PrimDemand Identity))
+demandList context function as =
   unsafePerformIO $ do
     topDemand <- newIORef Nothing
-    evaluate $ c . f $ instrumentListD topDemand as
-    traverse derefDemand =<< readIORef topDemand
+    let result = function $ instrumentListD topDemand as
+    evaluate $ context result
+    resultDemand <- traverse derefDemand =<< readIORef topDemand
+    return (result, resultDemand)
 
 {-# NOINLINE demandList' #-}
 demandList' :: ([a] -> ()) -> [a]
@@ -221,9 +229,11 @@ demandList' c as =
 
 -- Recursively traverse a pointer-based demand and freeze it into an immutable
 -- demand suitable for the user-facing API.
-derefDemand :: ListDemand PrimDemand IORef -> IO (ListDemand PrimDemand Identity)
+derefDemand :: ListDemand PrimDemand IORef
+            -> IO (ListDemand PrimDemand Identity)
 derefDemand demand = do
   case demand of
+    Nil -> return Nil
     Cons primRef listRef ->
       do primDemand <- coerce <$> readIORef primRef
          maybeListDemand <- readIORef listRef
@@ -232,9 +242,6 @@ derefDemand demand = do
            Just listDemand -> do
              listDemand' <- derefDemand listDemand
              return $ Cons (Identity primDemand) (Identity (Just listDemand'))
-    Nil primRef ->
-      do primDemand <- coerce <$> readIORef primRef
-         return $ Nil (Identity primDemand)
 
 -- Instrument lists to report their evaluation in a particular IORef
 
@@ -247,13 +254,9 @@ derefDemand demand = do
 instrumentListD :: IORef (Maybe (ListDemand PrimDemand IORef)) -> [a] -> [a]
 instrumentListD demand as =
   case as of
-    [] ->
-      unsafePerformIO $ do
-        putStrLn "In Nil case of instrumentListD"
-        nullaryDemand <- newIORef $ Just Demanded
-        writeIORef demand $
-            Just (Nil nullaryDemand)
-        return $ []
+    [] -> unsafePerformIO $ do
+            writeIORef demand (Just Nil)
+            return []
     (a : as) ->
       unsafePerformIO $ do
         primDemand <- newIORef Nothing
