@@ -220,12 +220,14 @@ demandList context function as =
 
 {-# NOINLINE demandList' #-}
 demandList' :: ([a] -> ()) -> [a]
-           -> Maybe (ListDemand PrimDemand Identity)
+           -> ([a], Maybe (ListDemand PrimDemand Identity))
 demandList' c as =
   unsafePerformIO $ do
     topDemand <- newIORef Nothing
-    evaluate $ c $ instrumentListD topDemand as
-    traverse derefDemand =<< readIORef topDemand
+    let result = instrumentListD topDemand as
+    evaluate $ c $ result
+    resultDemand <- traverse derefDemand =<< readIORef topDemand
+    return (result, resultDemand)
 
 -- Recursively traverse a pointer-based demand and freeze it into an immutable
 -- demand suitable for the user-facing API.
